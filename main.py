@@ -2,12 +2,24 @@ import requests
 import pandas as pd
 import xgboost as xgb
 import joblib
-from sklearn.model_selection import GridSearchCV, KFold
-from sklearn.metrics import mean_squared_error, accuracy_score
+from sklearn.model_selection import GridSearchCV
 from sklearn.preprocessing import OneHotEncoder
 
 API_KEY = 'INSERT_YOUR_API_KEY' 
 HEADERS = {'X-Auth-Token': API_KEY}
+
+# Define weekly date ranges for testing
+weekly_ranges = [
+    ('2024-08-15', '2024-08-19'),  # Week 1
+    ('2024-08-23', '2024-08-25'),  # Week 2
+    ('2024-08-26', '2024-08-29'),  # Week 3
+    ('2024-08-31', '2024-09-01'),  # Week 4
+    ('2024-09-13', '2024-09-16'),  # Week 5
+    ('2024-09-20', '2024-09-23'),  # Week 6
+    ('2024-09-24', '2024-09-26'),  # Week 7
+    ('2024-09-27', '2024-09-30'),  # Week 8
+    ('2024-10-04', '2024-10-06')   # Week 9
+]
 
 # Fetch La Liga matches data
 def fetch_match_data(league_id='PD', season='2023'):
@@ -30,7 +42,6 @@ def prepare_data(matches):
             ht_home_team_goals = half_time.get('home', 0)
             ht_away_team_goals = half_time.get('away', 0)
 
-            # Outcome scaled to [-1, 1]
             outcome = 1 if match['score']['winner'] == 'HOME_TEAM' else -1 if match['score']['winner'] == 'AWAY_TEAM' else 0
             ht_winner = 1 if ht_home_team_goals > ht_away_team_goals else -1 if ht_home_team_goals < ht_away_team_goals else 0
 
@@ -45,26 +56,19 @@ def prepare_data(matches):
                 'Half Time Winner': ht_winner,
                 'Total Goals': home_team_goals + away_team_goals,
                 'Half Time Total Goals': ht_home_team_goals + ht_away_team_goals,
+                'utcDate': match['utcDate']
             })
 
     df = pd.DataFrame(data)
-    
-    # Adjust Half Time Winner class labels to [0, 1, 2] instead of [-1, 0, 1]
     df['Half Time Winner'] = df['Half Time Winner'].map({-1: 0, 0: 1, 1: 2})
-
     return df
 
 # Perform one-hot encoding on team names
 def one_hot_encode_teams(df):
-    encoder = OneHotEncoder(handle_unknown='ignore')  # Set handle_unknown to ignore new categories
+    encoder = OneHotEncoder(handle_unknown='ignore')
     team_names = df[['Home Team', 'Away Team']]
-
-    # Fit and transform the team names to one-hot encoding
     one_hot_encoded_teams = encoder.fit_transform(team_names).toarray()
-
-    # Create a DataFrame from the one-hot encoded array
     one_hot_encoded_df = pd.DataFrame(one_hot_encoded_teams, columns=encoder.get_feature_names_out(['Home Team', 'Away Team']))
-
     return one_hot_encoded_df, encoder
 
 # Save the model to a file
@@ -86,107 +90,75 @@ def hyperparameter_tuning_xgboost(X, y, task_type='regression'):
         'colsample_bytree': [0.8, 1]
     }
     model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42) if task_type == 'regression' else xgb.XGBClassifier(random_state=42)
-    
     grid_search = GridSearchCV(model, param_grid, cv=5, scoring='neg_mean_squared_error' if task_type == 'regression' else 'accuracy')
     grid_search.fit(X, y)
     print(f"Best parameters: {grid_search.best_params_}")
     return grid_search.best_estimator_
 
-# Evaluate models using k-fold cross-validation and print actual vs. predicted
-def evaluate_model(model, X, y, task_type='regression'):
-    kfold = KFold(n_splits=5, shuffle=True, random_state=42)
-    scores = []
-    actuals = []
-    predictions = []
+# Function to filter matches within a date range
+def filter_matches_by_date(df, start_date, end_date):
+    # Ensure 'Match Date' column is in UTC
+    df['Match Date'] = pd.to_datetime(df['utcDate']).dt.tz_convert('UTC')
+    
+    # Convert start_date and end_date to UTC
+    start_date = pd.to_datetime(start_date).tz_localize('UTC')
+    end_date = pd.to_datetime(end_date).tz_localize('UTC')
+    
+    # Filter the matches
+    return df[(df['Match Date'] >= start_date) & (df['Match Date'] <= end_date)]
 
-    for train_idx, test_idx in kfold.split(X):
-        model.fit(X.iloc[train_idx], y.iloc[train_idx])
-        preds = model.predict(X.iloc[test_idx])
 
-        # Store actual and predicted values for comparison
-        actuals.extend(y.iloc[test_idx])
-        predictions.extend(preds)
-
-        if task_type == 'regression':
-            scores.append(mean_squared_error(y.iloc[test_idx], preds))
-        else:
-            scores.append(accuracy_score(y.iloc[test_idx], preds))
-
-    print(f"\nCross-validated {'MSE' if task_type == 'regression' else 'accuracy'}: {sum(scores) / len(scores)}")
-
-def main():
-    # Fetch and prepare La Liga match data for 2023
-    matches = fetch_match_data()
-    df = prepare_data(matches)
-
-    # One-Hot Encode Team Names
-    X, encoder = one_hot_encode_teams(df)
-
-    # Save the encoder
-    joblib.dump(encoder, 'team_name_encoder.pkl')
-
-    # Target variables for different tasks
-    y_outcome = df['Outcome']  # Regression task (-1 to 1)
-    y_ht_winner = df['Half Time Winner']  # Classification task (remapped to 0, 1, 2)
-    y_total_goals = df['Total Goals']  # Regression task (continuous total goals)
-
-    # Train XGBoost for match outcome (regression) and save the model
-    print("Tuning hyperparameters for match outcome prediction...")
-    xgb_outcome = hyperparameter_tuning_xgboost(X, y_outcome, task_type='regression')
-    save_model(xgb_outcome, "xgb_outcome_2023.pkl")
-
-    print("Evaluating match outcome model...")
-    evaluate_model(xgb_outcome, X, y_outcome, task_type='regression')
-
-    # Train XGBoost for half-time winner (classification) and save the model
-    print("Tuning hyperparameters for half-time winner prediction...")
-    xgb_ht_winner = hyperparameter_tuning_xgboost(X, y_ht_winner, task_type='classification')
-    save_model(xgb_ht_winner, "xgb_ht_winner_2023.pkl")
-
-    print("Evaluating half-time winner model...")
-    evaluate_model(xgb_ht_winner, X, y_ht_winner, task_type='classification')
-
-    # Train XGBoost for total goals prediction (regression) and save the model
-    print("Tuning hyperparameters for total goals prediction...")
-    xgb_total_goals = hyperparameter_tuning_xgboost(X, y_total_goals, task_type='regression')
-    save_model(xgb_total_goals, "xgb_total_goals_2023.pkl")
-
-    print("Evaluating total goals model...")
-    evaluate_model(xgb_total_goals, X, y_total_goals, task_type='regression')
-
-# Backtest on the 2024 season and save predictions as CSV
-def backtest_on_2024_season():
-    # Fetch 2024 season data
+def backtest_weekly_on_2024_season():
+    matches_2023 = fetch_match_data(season='2023')
+    df_2023 = prepare_data(matches_2023)
+    
+    X_2023, encoder = one_hot_encode_teams(df_2023)
+    y_outcome_2023 = df_2023['Outcome']
+    xgb_outcome = hyperparameter_tuning_xgboost(X_2023, y_outcome_2023, task_type='regression')
+    save_model(xgb_outcome, 'xgb_outcome_base_2023.pkl')
+    
     matches_2024 = fetch_match_data(season='2024')
     df_2024 = prepare_data(matches_2024)
-
-    # Load the encoder for team names
-    encoder = joblib.load('team_name_encoder.pkl')
-
-    # Apply the encoder to the 2024 season data
-    X_2024 = encoder.transform(df_2024[['Home Team', 'Away Team']]).toarray()
-
-    # Target variables for backtesting
-    y_outcome_2024 = df_2024['Outcome']
-
-    # Load trained model for match outcome from 2023
-    xgb_outcome_2023 = load_model("xgb_outcome_2023.pkl")
-
-    # Predict match outcomes for 2024 season
-    predictions = xgb_outcome_2023.predict(X_2024)
-
-    # Create a DataFrame with actual outcomes, predicted outcomes, and team names
-    results = pd.DataFrame({
-        'Home Team': df_2024['Home Team'],
-        'Away Team': df_2024['Away Team'],
-        'Actual Outcome': y_outcome_2024,
-        'Predicted Outcome': predictions
-    })
-
-    # Save the DataFrame to CSV
-    results.to_csv('match_outcome_predictions_2024.csv', index=False)
-    print("Predictions saved to match_outcome_predictions_2024.csv")
+    
+    total_units = 0  # Track cumulative units
+    
+    for i, (start_date, end_date) in enumerate(weekly_ranges):
+        weekly_df = filter_matches_by_date(df_2024, start_date, end_date)
+        if weekly_df.empty:
+            print(f"No matches found for week {i+1} ({start_date} to {end_date})")
+            continue
+        
+        X_week = encoder.transform(weekly_df[['Home Team', 'Away Team']]).toarray()
+        y_week_outcome = weekly_df['Outcome']
+        
+        all_train_data = pd.concat([df_2023] + [filter_matches_by_date(df_2024, weekly_ranges[j][0], weekly_ranges[j][1]) for j in range(i)], ignore_index=True)
+        X_all_train = encoder.transform(all_train_data[['Home Team', 'Away Team']]).toarray()
+        y_all_train_outcome = all_train_data['Outcome']
+        
+        xgb_outcome.fit(X_all_train, y_all_train_outcome)
+        predictions = xgb_outcome.predict(X_week)
+        
+        # Initialize results DataFrame with betting logic
+        weekly_results = pd.DataFrame({
+            'Home Team': weekly_df['Home Team'],
+            'Away Team': weekly_df['Away Team'],
+            'Actual Outcome': y_week_outcome,
+            'Predicted Outcome': predictions
+        })
+        
+        # Define betting result conditions
+        weekly_results['Betting Result'] = weekly_results.apply(lambda row: 
+            2.2 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] == 0 else
+            -1 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] != 0 else
+            0, axis=1)
+        
+        # Calculate cumulative betting results
+        total_units += weekly_results['Betting Result'].sum()
+        weekly_results['Cumulative Units'] = total_units
+        
+        # Save results to CSV
+        weekly_results.to_csv(f'match_outcome_predictions_week_{i+1}.csv', index=False)
+        print(f"Week {i+1} predictions saved to match_outcome_predictions_week_{i+1}.csv")
 
 if __name__ == '__main__':
-    main()
-    backtest_on_2024_season()
+    backtest_weekly_on_2024_season()
