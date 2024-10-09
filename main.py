@@ -1,3 +1,4 @@
+import argparse
 import requests
 import pandas as pd
 import xgboost as xgb
@@ -9,16 +10,22 @@ API_KEY = 'INSERT_YOUR_API_KEY'
 HEADERS = {'X-Auth-Token': API_KEY}
 
 weekly_ranges = [
-    ('2024-08-15', '2024-08-19'),  
-    ('2024-08-23', '2024-08-25'),  
-    ('2024-08-26', '2024-08-29'),  
-    ('2024-08-31', '2024-09-01'),  
-    ('2024-09-13', '2024-09-16'),  
-    ('2024-09-20', '2024-09-23'),  
-    ('2024-09-24', '2024-09-26'),  
-    ('2024-09-27', '2024-09-30'),  
-    ('2024-10-04', '2024-10-06')   
+    ('2024-08-15', '2024-08-20'),  
+    ('2024-08-23', '2024-08-26'),  
+    ('2024-08-26', '2024-08-30'),  
+    ('2024-08-31', '2024-09-02'),  
+    ('2024-09-13', '2024-09-17'),  
+    ('2024-09-20', '2024-09-24'),  
+    ('2024-09-24', '2024-09-27'),  
+    ('2024-09-27', '2024-10-01'),  
+    ('2024-10-04', '2024-10-07')   
 ]
+
+LEAGUES = {
+    'La_Liga': 'PD',
+    'Premier_League': 'PL',
+    'Serie_A': 'SA',
+}
 
 def fetch_match_data(league_id, season):
     url = f'https://api.football-data.org/v4/competitions/{league_id}/matches?season={season}'
@@ -107,40 +114,46 @@ def backtest_weekly_for_league(league_id, league_name, season_base='2023'):
     df_2024 = prepare_data(matches_2024)
     total_units = 0
 
-    for i, (start_date, end_date) in enumerate(weekly_ranges):
-        weekly_df = filter_matches_by_date(df_2024, start_date, end_date)
-        if weekly_df.empty:
-            print(f"No matches found for {league_name} week {i+1} ({start_date} to {end_date})")
-            continue
-        
-        X_week = encoder.transform(weekly_df[['Home Team', 'Away Team']]).toarray()
-        y_week_outcome = weekly_df['Outcome']
-        
-        all_train_data = pd.concat([df] + [filter_matches_by_date(df_2024, weekly_ranges[j][0], weekly_ranges[j][1]) for j in range(i)], ignore_index=True)
-        X_all_train = encoder.transform(all_train_data[['Home Team', 'Away Team']]).toarray()
-        y_all_train_outcome = all_train_data['Outcome']
-        
-        model.fit(X_all_train, y_all_train_outcome)
-        predictions = model.predict(X_week)
-        
-        weekly_results = pd.DataFrame({
-            'Home Team': weekly_df['Home Team'],
-            'Away Team': weekly_df['Away Team'],
-            'Actual Outcome': y_week_outcome,
-            'Predicted Outcome': predictions
-        })
-        
-        weekly_results['Betting Result'] = weekly_results.apply(lambda row: 
-            2.2 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] == 0 else
-            -1 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] != 0 else
-            0, axis=1)
-        
-        total_units += weekly_results['Betting Result'].sum()
-        weekly_results['Cumulative Units'] = total_units
-        
-        weekly_results.to_csv(f'{league_name}_predictions_week_{i+1}.csv', index=False)
-        print(f"{league_name} Week {i+1} predictions saved to {league_name}_predictions_week_{i+1}.csv")
+    with pd.ExcelWriter(f'{league_name}_predictions.xlsx', engine='openpyxl') as writer:
+        for i, (start_date, end_date) in enumerate(weekly_ranges):
+            weekly_df = filter_matches_by_date(df_2024, start_date, end_date)
+            if weekly_df.empty:
+                print(f"No matches found for {league_name} week {i+1} ({start_date} to {end_date})")
+                continue
+            
+            X_week = encoder.transform(weekly_df[['Home Team', 'Away Team']]).toarray()
+            y_week_outcome = weekly_df['Outcome']
+            
+            all_train_data = pd.concat([df] + [filter_matches_by_date(df_2024, weekly_ranges[j][0], weekly_ranges[j][1]) for j in range(i)], ignore_index=True)
+            X_all_train = encoder.transform(all_train_data[['Home Team', 'Away Team']]).toarray()
+            y_all_train_outcome = all_train_data['Outcome']
+            
+            model.fit(X_all_train, y_all_train_outcome)
+            predictions = model.predict(X_week)
+            
+            weekly_results = pd.DataFrame({
+                'Home Team': weekly_df['Home Team'],
+                'Away Team': weekly_df['Away Team'],
+                'Actual Outcome': y_week_outcome,
+                'Predicted Outcome': predictions
+            })
+            
+            weekly_results['Betting Result'] = weekly_results.apply(lambda row: 
+                2.2 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] == 0 else
+                -1 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] != 0 else
+                0, axis=1)
+            
+            total_units += weekly_results['Betting Result'].sum()
+            weekly_results['Cumulative Units'] = total_units
+            
+            weekly_results.to_excel(writer, sheet_name=f'Week_{i+1}', index=False)
+            print(f"{league_name} Week {i+1} predictions added to Excel file")
 
 if __name__ == '__main__':
-    backtest_weekly_for_league('PD', 'La_Liga', season_base='2023')
-    backtest_weekly_for_league('PL', 'Premier_League', season_base='2023')
+    parser = argparse.ArgumentParser(description="Backtest football predictions by league.")
+    parser.add_argument('--leagues', nargs='+', choices=LEAGUES.keys(), required=True, help="Leagues to backtest (La_Liga, Premier_League, Serie_A)")
+    args = parser.parse_args()
+    
+    for league_name in args.leagues:
+        league_id = LEAGUES[league_name]
+        backtest_weekly_for_league(league_id, league_name, season_base='2023')
