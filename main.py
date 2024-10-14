@@ -6,20 +6,8 @@ import joblib
 from sklearn.model_selection import GridSearchCV
 from sklearn.preprocessing import OneHotEncoder
 
-API_KEY = 'INSERT_YOUR_API_KEY' 
+API_KEY = '57f3688019a0433fb6c52744fafee577' 
 HEADERS = {'X-Auth-Token': API_KEY}
-
-weekly_ranges = [
-    ('2024-08-15', '2024-08-20'),  
-    ('2024-08-23', '2024-08-26'),  
-    ('2024-08-26', '2024-08-30'),  
-    ('2024-08-31', '2024-09-02'),  
-    ('2024-09-13', '2024-09-17'),  
-    ('2024-09-20', '2024-09-24'),  
-    ('2024-09-24', '2024-09-27'),  
-    ('2024-09-27', '2024-10-01'),  
-    ('2024-10-04', '2024-10-07')   
-]
 
 LEAGUES = {
     'La_Liga': 'PD',
@@ -95,59 +83,66 @@ def hyperparameter_tuning_xgboost(X, y, task_type='regression'):
     print(f"Best parameters: {grid_search.best_params_}")
     return grid_search.best_estimator_
 
-def filter_matches_by_date(df, start_date, end_date):
-    df['Match Date'] = pd.to_datetime(df['utcDate']).dt.tz_convert('UTC')
-    start_date = pd.to_datetime(start_date).tz_localize('UTC')
-    end_date = pd.to_datetime(end_date).tz_localize('UTC')
-    return df[(df['Match Date'] >= start_date) & (df['Match Date'] <= end_date)]
-
-def backtest_weekly_for_league(league_id, league_name, season_base='2023'):
+def backtest_daily_for_league(league_id, league_name, season_base='2023'):
+    # Fetch and prepare the base training data from 2023
     matches = fetch_match_data(league_id, season=season_base)
     df = prepare_data(matches)
+    df['utcDate'] = pd.to_datetime(df['utcDate']).dt.date  # Convert to date only
     X_base, encoder = one_hot_encode_teams(df)
     y_outcome_base = df['Outcome']
     
+    # Initial training with 2023 data
     model = hyperparameter_tuning_xgboost(X_base, y_outcome_base, task_type='regression')
     save_model(model, f'xgb_outcome_base_{league_name}.pkl')
     
+    # Fetch and prepare matches for 2024 season
     matches_2024 = fetch_match_data(league_id, season='2024')
     df_2024 = prepare_data(matches_2024)
+    df_2024['utcDate'] = pd.to_datetime(df_2024['utcDate']).dt.date  # Convert to date only
     total_units = 0
-
-    with pd.ExcelWriter(f'{league_name}_predictions.xlsx', engine='openpyxl') as writer:
-        for i, (start_date, end_date) in enumerate(weekly_ranges):
-            weekly_df = filter_matches_by_date(df_2024, start_date, end_date)
-            if weekly_df.empty:
-                print(f"No matches found for {league_name} week {i+1} ({start_date} to {end_date})")
+    
+    # Filter daily and backtest day by day
+    with pd.ExcelWriter(f'{league_name}_daily_predictions.xlsx', engine='openpyxl') as writer:
+        unique_dates = sorted(df_2024['utcDate'].unique())
+        
+        for i, current_date in enumerate(unique_dates):
+            daily_df = df_2024[df_2024['utcDate'] == current_date]
+            if daily_df.empty:
+                print(f"No matches found for {league_name} on {current_date}")
                 continue
+
+            X_day = encoder.transform(daily_df[['Home Team', 'Away Team']]).toarray()
+            y_day_outcome = daily_df['Outcome']
             
-            X_week = encoder.transform(weekly_df[['Home Team', 'Away Team']]).toarray()
-            y_week_outcome = weekly_df['Outcome']
-            
-            all_train_data = pd.concat([df] + [filter_matches_by_date(df_2024, weekly_ranges[j][0], weekly_ranges[j][1]) for j in range(i)], ignore_index=True)
+            # Combine 2023 data + previous days in 2024 as training data
+            all_train_data = pd.concat([df] + [df_2024[df_2024['utcDate'] <= unique_dates[i-1]]], ignore_index=True)
             X_all_train = encoder.transform(all_train_data[['Home Team', 'Away Team']]).toarray()
             y_all_train_outcome = all_train_data['Outcome']
             
+            # Retrain model with all available data
             model.fit(X_all_train, y_all_train_outcome)
-            predictions = model.predict(X_week)
+            predictions = model.predict(X_day)
             
-            weekly_results = pd.DataFrame({
-                'Home Team': weekly_df['Home Team'],
-                'Away Team': weekly_df['Away Team'],
-                'Actual Outcome': y_week_outcome,
+            # Prepare daily results
+            daily_results = pd.DataFrame({
+                'Home Team': daily_df['Home Team'],
+                'Away Team': daily_df['Away Team'],
+                'Actual Outcome': y_day_outcome,
                 'Predicted Outcome': predictions
             })
             
-            weekly_results['Betting Result'] = weekly_results.apply(lambda row: 
+            daily_results['Betting Result'] = daily_results.apply(lambda row: 
                 2.2 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] == 0 else
                 -1 if abs(row['Predicted Outcome']) < 0.2 and row['Actual Outcome'] != 0 else
                 0, axis=1)
             
-            total_units += weekly_results['Betting Result'].sum()
-            weekly_results['Cumulative Units'] = total_units
+            total_units += daily_results['Betting Result'].sum()
+            daily_results['Cumulative Units'] = total_units
             
-            weekly_results.to_excel(writer, sheet_name=f'Week_{i+1}', index=False)
-            print(f"{league_name} Week {i+1} predictions added to Excel file")
+            # Format date for sheet name and save to Excel
+            sheet_name = current_date.strftime('%Y-%m-%d')
+            daily_results.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"{league_name} predictions for {sheet_name} added to Excel file")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Backtest football predictions by league.")
@@ -156,4 +151,4 @@ if __name__ == '__main__':
     
     for league_name in args.leagues:
         league_id = LEAGUES[league_name]
-        backtest_weekly_for_league(league_id, league_name, season_base='2023')
+        backtest_daily_for_league(league_id, league_name, season_base='2023')
