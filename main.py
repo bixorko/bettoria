@@ -4,12 +4,12 @@ import pandas as pd
 import xgboost as xgb
 import joblib
 import numpy as np
-from sklearn.model_selection import GridSearchCV
+import optuna
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics import f1_score, make_scorer
+from sklearn.metrics import f1_score
 from sklearn.utils.class_weight import compute_sample_weight
 
-API_KEY = '57f3688019a0433fb6c52744fafee577' 
+API_KEY = '57f3688019a0433fb6c52744fafee577'
 HEADERS = {'X-Auth-Token': API_KEY}
 
 LEAGUES = {
@@ -60,7 +60,6 @@ def prepare_data(matches):
     return df
 
 def prepare_features(df, encoder=None, is_training=True):
-    # One-hot encode the teams
     team_names = df[['Home Team', 'Away Team']]
     if is_training:
         encoder = OneHotEncoder(handle_unknown='ignore')
@@ -68,13 +67,8 @@ def prepare_features(df, encoder=None, is_training=True):
     else:
         one_hot_encoded_teams = encoder.transform(team_names).toarray()
     one_hot_encoded_df = pd.DataFrame(one_hot_encoded_teams, columns=encoder.get_feature_names_out(['Home Team', 'Away Team']))
-
-    # Include other features
     other_features = df[['Half Time Winner', 'Half Time Total Goals']].reset_index(drop=True)
-
-    # Combine
     X = pd.concat([one_hot_encoded_df.reset_index(drop=True), other_features], axis=1)
-
     return X, encoder
 
 def save_model(model, filename):
@@ -84,52 +78,45 @@ def save_model(model, filename):
 def load_model(filename):
     return joblib.load(filename)
 
-def hyperparameter_tuning_xgboost(X, y, task_type='classification'):
-    if task_type == 'classification':
-        model = xgb.XGBClassifier(random_state=42)
-        param_grid = {
-            'n_estimators': [100, 200],
-            'max_depth': [3, 6],
-            'learning_rate': [0.01, 0.1],
-            'subsample': [0.8, 1],
-            'colsample_bytree': [0.8, 1],
+def optimize_xgboost_params(X, y):
+    def objective(trial):
+        param = {
+            'objective': 'multi:softprob',
+            'num_class': 3,
+            'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'random_state': 42
         }
 
-        def f1_draw(y_true, y_pred):
-            return f1_score(y_true, y_pred, labels=[1], average='micro')
-
-        scorer = make_scorer(f1_draw)
-
-        # Compute sample weights to handle class imbalance
+        model = xgb.XGBClassifier(**param)
         sample_weights = compute_sample_weight(class_weight='balanced', y=y)
+        model.fit(X, y, sample_weight=sample_weights)
+        predictions = model.predict(X)
+        return f1_score(y, predictions, labels=[1], average='micro')
 
-        grid_search = GridSearchCV(model, param_grid, cv=5, scoring=scorer)
-        grid_search.fit(X, y, sample_weight=sample_weights)
-        print(f"Best parameters: {grid_search.best_params_}")
-        return grid_search.best_estimator_
-    else:
-        # Regression code (if needed)
-        pass
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=20)
+    return study.best_params
 
 def backtest_daily_for_league(league_id, league_name, season_base='2023'):
-    # Fetch and prepare the base training data from 2023
     matches = fetch_match_data(league_id, season=season_base)
     df = prepare_data(matches)
-    df['utcDate'] = pd.to_datetime(df['utcDate']).dt.date  # Convert to date only
+    df['utcDate'] = pd.to_datetime(df['utcDate']).dt.date
     X_base, encoder = prepare_features(df)
     y_outcome_base = df['Outcome']
 
-    # Initial training with 2023 data
-    model = hyperparameter_tuning_xgboost(X_base, y_outcome_base, task_type='classification')
+    best_params = optimize_xgboost_params(X_base, y_outcome_base)
+    model = xgb.XGBClassifier(**best_params, random_state=42)
     save_model(model, f'xgb_outcome_base_{league_name}.pkl')
 
-    # Fetch and prepare matches for 2024 season
-    matches_2024 = fetch_match_data(league_id, season='2023')
+    matches_2024 = fetch_match_data(league_id, season='2024')
     df_2024 = prepare_data(matches_2024)
-    df_2024['utcDate'] = pd.to_datetime(df_2024['utcDate']).dt.date  # Convert to date only
+    df_2024['utcDate'] = pd.to_datetime(df_2024['utcDate']).dt.date
     total_units = 0
 
-    # Filter daily and backtest day by day
     with pd.ExcelWriter(f'{league_name}_daily_predictions.xlsx', engine='openpyxl') as writer:
         unique_dates = sorted(df_2024['utcDate'].unique())
 
@@ -142,7 +129,6 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
             X_day, _ = prepare_features(daily_df, encoder=encoder, is_training=False)
             y_day_outcome = daily_df['Outcome']
 
-            # Combine 2023 data + previous days in 2024 as training data
             if i == 0:
                 all_train_data = df
             else:
@@ -150,13 +136,10 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
             X_all_train, _ = prepare_features(all_train_data, encoder=encoder, is_training=False)
             y_all_train_outcome = all_train_data['Outcome']
 
-            # Retrain model with all available data
-            sample_weights = compute_sample_weight(class_weight='balanced', y=y_all_train_outcome)
-            model.fit(X_all_train, y_all_train_outcome, sample_weight=sample_weights)
+            model.fit(X_all_train, y_all_train_outcome, sample_weight=compute_sample_weight(class_weight='balanced', y=y_all_train_outcome))
             predictions_proba = model.predict_proba(X_day)
             draw_probs = predictions_proba[:, 1]
 
-            # Prepare daily results
             daily_results = pd.DataFrame({
                 'Home Team': daily_df['Home Team'],
                 'Away Team': daily_df['Away Team'],
@@ -164,11 +147,9 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
                 'Predicted Draw Probability': draw_probs
             })
 
-            # Betting logic
-            draw_threshold = 0.4  # You may adjust this threshold
+            draw_threshold = 0.4
             daily_results['Bet on Draw'] = (draw_probs >= draw_threshold).astype(int)
             daily_results['Actual Draw'] = (y_day_outcome == 1).astype(int)
-
             daily_results['Betting Result'] = daily_results.apply(lambda row: 
                 2.2 if row['Bet on Draw'] == 1 and row['Actual Draw'] == 1 else
                 -1 if row['Bet on Draw'] == 1 and row['Actual Draw'] == 0 else
@@ -177,7 +158,6 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
             total_units += daily_results['Betting Result'].sum()
             daily_results['Cumulative Units'] = total_units
 
-            # Format date for sheet name and save to Excel
             sheet_name = current_date.strftime('%Y-%m-%d')
             daily_results.to_excel(writer, sheet_name=sheet_name, index=False)
             print(f"{league_name} predictions for {sheet_name} added to Excel file")
@@ -189,4 +169,4 @@ if __name__ == '__main__':
 
     for league_name in args.leagues:
         league_id = LEAGUES[league_name]
-        backtest_daily_for_league(league_id, league_name, season_base='2022')
+        backtest_daily_for_league(league_id, league_name, season_base='2023')
