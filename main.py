@@ -6,8 +6,9 @@ import joblib
 import numpy as np
 import optuna
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, make_scorer
 from sklearn.utils.class_weight import compute_sample_weight
+from datetime import datetime
 
 API_KEY = '57f3688019a0433fb6c52744fafee577'
 HEADERS = {'X-Auth-Token': API_KEY}
@@ -57,6 +58,14 @@ def prepare_data(matches):
     df = pd.DataFrame(data)
     df['Half Time Winner'] = df['Half Time Winner'].map({-1: 0, 0: 1, 1: 2})
     df['Outcome'] = df['Outcome'].map({-1: 0, 0: 1, 1: 2})
+    df['utcDate'] = pd.to_datetime(df['utcDate']).dt.date
+    return df
+
+def add_team_form_features(df, window=5):
+    df['Home Team Form'] = df.groupby('Home Team')['Outcome'].transform(lambda x: x.rolling(window, min_periods=1).mean())
+    df['Away Team Form'] = df.groupby('Away Team')['Outcome'].transform(lambda x: x.rolling(window, min_periods=1).mean())
+    df['Home Team Momentum'] = df['Home Team Form'].apply(lambda x: 1 if x > 0.5 else -1 if x < -0.5 else 0)
+    df['Away Team Momentum'] = df['Away Team Form'].apply(lambda x: 1 if x > 0.5 else -1 if x < -0.5 else 0)
     return df
 
 def prepare_features(df, encoder=None, is_training=True):
@@ -67,27 +76,20 @@ def prepare_features(df, encoder=None, is_training=True):
     else:
         one_hot_encoded_teams = encoder.transform(team_names).toarray()
     one_hot_encoded_df = pd.DataFrame(one_hot_encoded_teams, columns=encoder.get_feature_names_out(['Home Team', 'Away Team']))
-    other_features = df[['Half Time Winner', 'Half Time Total Goals']].reset_index(drop=True)
+    other_features = df[['Half Time Winner', 'Half Time Total Goals', 'Home Team Form', 'Away Team Form', 'Home Team Momentum', 'Away Team Momentum']].reset_index(drop=True)
     X = pd.concat([one_hot_encoded_df.reset_index(drop=True), other_features], axis=1)
     return X, encoder
-
-def save_model(model, filename):
-    joblib.dump(model, filename)
-    print(f"Model saved to {filename}")
-
-def load_model(filename):
-    return joblib.load(filename)
 
 def optimize_xgboost_params(X, y):
     def objective(trial):
         param = {
             'objective': 'multi:softprob',
             'num_class': 3,
-            'n_estimators': trial.suggest_int('n_estimators', 100, 300),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'n_estimators': trial.suggest_int('n_estimators', 200, 400),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'subsample': trial.suggest_float('subsample', 0.7, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
             'random_state': 42
         }
 
@@ -98,28 +100,28 @@ def optimize_xgboost_params(X, y):
         return f1_score(y, predictions, labels=[1], average='micro')
 
     study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=20)
+    study.optimize(objective, n_trials=40)  # Increased trials
     return study.best_params
 
 def backtest_daily_for_league(league_id, league_name, season_base='2023'):
     matches = fetch_match_data(league_id, season=season_base)
     df = prepare_data(matches)
-    df['utcDate'] = pd.to_datetime(df['utcDate']).dt.date
+    df = add_team_form_features(df)
     X_base, encoder = prepare_features(df)
     y_outcome_base = df['Outcome']
 
     best_params = optimize_xgboost_params(X_base, y_outcome_base)
     model = xgb.XGBClassifier(**best_params, random_state=42)
-    save_model(model, f'xgb_outcome_base_{league_name}.pkl')
+    model.fit(X_base, y_outcome_base, sample_weight=compute_sample_weight(class_weight='balanced', y=y_outcome_base))
 
-    matches_2024 = fetch_match_data(league_id, season='2024')
+    matches_2024 = fetch_match_data(league_id, season='2023')
     df_2024 = prepare_data(matches_2024)
-    df_2024['utcDate'] = pd.to_datetime(df_2024['utcDate']).dt.date
+    df_2024 = add_team_form_features(df_2024)
     total_units = 0
+    draw_threshold = 0.4
 
     with pd.ExcelWriter(f'{league_name}_daily_predictions.xlsx', engine='openpyxl') as writer:
         unique_dates = sorted(df_2024['utcDate'].unique())
-
         for i, current_date in enumerate(unique_dates):
             daily_df = df_2024[df_2024['utcDate'] == current_date]
             if daily_df.empty:
@@ -129,16 +131,20 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
             X_day, _ = prepare_features(daily_df, encoder=encoder, is_training=False)
             y_day_outcome = daily_df['Outcome']
 
-            if i == 0:
-                all_train_data = df
-            else:
-                all_train_data = pd.concat([df, df_2024[df_2024['utcDate'] <= unique_dates[i-1]]], ignore_index=True)
-            X_all_train, _ = prepare_features(all_train_data, encoder=encoder, is_training=False)
-            y_all_train_outcome = all_train_data['Outcome']
+            if i > 0:
+                train_df = pd.concat([df, df_2024[df_2024['utcDate'] <= unique_dates[i-1]]], ignore_index=True)
+                train_df = add_team_form_features(train_df)
+                X_all_train, _ = prepare_features(train_df, encoder=encoder, is_training=False)
+                y_all_train_outcome = train_df['Outcome']
+                model.fit(X_all_train, y_all_train_outcome, sample_weight=compute_sample_weight(class_weight='balanced', y=y_all_train_outcome))
 
-            model.fit(X_all_train, y_all_train_outcome, sample_weight=compute_sample_weight(class_weight='balanced', y=y_all_train_outcome))
             predictions_proba = model.predict_proba(X_day)
             draw_probs = predictions_proba[:, 1]
+
+            if i > 0 and i % 7 == 0:  # Weekly adjustment based on recent performance
+                recent_bets = df_2024[df_2024['utcDate'] > unique_dates[i-7]]['Outcome'] == 1
+                draw_success_rate = recent_bets.mean()
+                draw_threshold = max(0.3, min(0.5, draw_threshold + (0.1 if draw_success_rate > 0.5 else -0.1)))
 
             daily_results = pd.DataFrame({
                 'Home Team': daily_df['Home Team'],
@@ -147,7 +153,6 @@ def backtest_daily_for_league(league_id, league_name, season_base='2023'):
                 'Predicted Draw Probability': draw_probs
             })
 
-            draw_threshold = 0.4
             daily_results['Bet on Draw'] = (draw_probs >= draw_threshold).astype(int)
             daily_results['Actual Draw'] = (y_day_outcome == 1).astype(int)
             daily_results['Betting Result'] = daily_results.apply(lambda row: 
@@ -169,4 +174,4 @@ if __name__ == '__main__':
 
     for league_name in args.leagues:
         league_id = LEAGUES[league_name]
-        backtest_daily_for_league(league_id, league_name, season_base='2023')
+        backtest_daily_for_league(league_id, league_name, season_base='2022')
